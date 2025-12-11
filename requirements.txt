@@ -1,0 +1,8 @@
+apify-client
+gspread
+oauth2client
+pandas
+python-dotenv
+pydantic>=2.0
+typer
+litellm
