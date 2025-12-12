@@ -53,7 +53,9 @@ from data_utils import (
     bulk_update_mapping,
     save_json,
     load_json,
-    TMP_DIR
+    TMP_DIR,
+    load_registry,
+    get_dataset_path
 )
 
 from llm.config import DEFAULT_MODEL, DEFAULT_BATCH_SIZE
@@ -203,6 +205,40 @@ def process(
         # Filter out None values
         items = [item for item in items if item.get("value") is not None]
         
+        # Skip already-processed items (check existing results file)
+        first_field = llm_output_fields[0]
+        registry = load_registry()
+        
+        # Check if this output file exists and has results
+        if results_file is None:
+            results_file = f"{source}_{first_field}.json"
+        results_path = os.path.join(TMP_DIR, results_file)
+        
+        processed_indices = set()
+        if os.path.exists(results_path):
+            existing = load_json(results_path)
+            if isinstance(existing, list):
+                processed_indices = {item.get('index') for item in existing if item.get('index') is not None}
+        
+        # Filter out already-processed items
+        original_count = len(items)
+        items = [item for item in items if item['index'] not in processed_indices]
+        skipped = original_count - len(items)
+        
+        if skipped > 0:
+            print(f"Skipping {skipped} already-processed items", file=sys.stderr)
+        
+        if not items:
+            output = ProcessOutput(
+                status="success",
+                processed=0,
+                results_file=results_path,
+                mapping_updated=False
+            )
+            print(output.model_dump_json(indent=2))
+            print(f"All {original_count} items already processed", file=sys.stderr)
+            return
+        
         if dry_run:
             output = ProcessOutput(
                 status="dry_run",
@@ -246,15 +282,27 @@ def process(
             except Exception:
                 existing_results = []
         
-        # Combine existing + new results
+        # SAFETY NET: Check for duplicate indices (should never happen with skip-already-processed)
+        existing_indices = {item.get("index") for item in existing_results if item.get("index") is not None}
+        new_indices = {item.get("index") for item in all_results if item.get("index") is not None}
+        duplicates = existing_indices & new_indices
+        
+        if duplicates:
+            raise ValueError(
+                f"DUPLICATE INDEX ERROR: Indices {sorted(duplicates)} already exist in {results_file}. "
+                "This should not happen if skip-already-processed is working correctly. "
+                "Check the skip logic or clear the output file to retry."
+            )
+        
+        # Combine existing + new results (safe now - no duplicates)
         combined_results = existing_results + all_results
         save_json(results_path, combined_results)
         
         # Use bulk_update_mapping from data_utils
-        # Maps ALL fields from LLM output to each lead
+        # NEW: Pass output_file to register fields in registry (no copying)
         index_field = f"{source.replace('Data', '')}Index" if source.endswith('Data') else f"{source}Index"
         
-        bulk_update_mapping(index_field, all_results)
+        bulk_update_mapping(index_field, all_results, output_file=results_file)
         
         # Output summary
         output = ProcessOutput(

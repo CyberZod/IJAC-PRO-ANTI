@@ -75,6 +75,16 @@ Break the objective into sequential validation criteria. Order from most unique/
 
 > Reference `FRAMEWORK.md` for data_utils and LLM module commands.
 
+### Pre-Planning Checks
+
+Before finalizing the plan:
+
+- [ ] **API Schema Verified** - If using new scrapers/APIs, test with 1-2 items first to understand output schema. Don't assume field names (e.g., `experience[0].position` vs `positions[0].title`).
+
+- [ ] **LLM Fields Reviewed** - Don't ask LLM to extract fields that already exist in raw API data. Use LLM for classification/judgment only (e.g., `isAgency`, not `agencyName` when `companyName` exists).
+
+- [ ] **Tools Support Re-runs** - Confirm tools skip already-processed items. See `FRAMEWORK.md` "Skip-Already-Processed Pattern".
+
 ---
 
 ## Quality Controls

@@ -34,26 +34,38 @@ execution/                  # Tool scripts
 
 ### 2. Mapping
 - Single evolving file: `.tmp/mapping.json`
+- **Contains ONLY index references** (no field values)
 - Links indices across datasets
-- Tracks enrichment pass/fail decisions
 - Structure:
 ```json
 {
   "leads": [
-    {
-      "postIndex": 0,
-      "passedRelevance": true,
-      "profileIndex": 0,
-      "passedStartup": true
-    }
+    {"postIndex": 0},
+    {"postIndex": 4, "profileIndex": 0}
   ]
 }
 ```
 
 ### 3. Registry
-- Defines dataset → index field relationships
+- Tracks which LLM output files contain which fields
 - Located at `.tmp/registry.json`
-- Convention: `xyzData` uses `xyzIndex`
+- Enables `--where` to lookup fields from LLM output files
+- Structure:
+```json
+{
+  "files": {
+    "postData_isPaidCanva.json": {"fields": ["isPaidCanva", "confidence"], "index_field": "postIndex"}
+  },
+  "fields": {
+    "isPaidCanva": "postData_isPaidCanva.json"
+  }
+}
+```
+
+### 4. LLM Output Files
+- LLM results stay in their own files (e.g., `postData_isPaidCanva.json`)
+- Not copied to mapping - referenced via registry
+- Structure: `[{index: 0, isPaidCanva: true, reasoning: "..."}]`
 
 ---
 
@@ -96,6 +108,37 @@ if __name__ == "__main__":
 3. **Always print** `model.model_dump_json()` - structured output for agents
 4. **Include docstring** with PURPOSE, USAGE, SAVES TO
 5. **Use Keyword Arguments** in Python calls (e.g., `func(arg=val)`) to prevent positional errors
+6. **CRITICAL: Auto-link indices** when creating new datasets from source data
+7. **Skip-already-processed** - Tools MUST check existing results and skip items already processed
+8. **API Schema Documentation** - Tools calling external APIs MUST document output schema in docstring
+9. **Error on duplicate indices** - When appending to output files, error if index already exists
+
+### Index Linking Requirement (CRITICAL)
+
+**Tools that create new datasets from source data MUST auto-link indices.**
+
+If a tool:
+1. Reads from a source dataset (e.g., postData)
+2. Creates a new target dataset (e.g., profileData)
+
+Then it MUST call `link_indices_func()` to connect source indices to target indices.
+
+**WHY THIS MATTERS:**
+- Without linking, LLM processing on the target dataset cannot update the mapping
+- Results are silently lost because `bulk_update_mapping` can't find matching leads
+- This is a **data integrity failure** that is hard to detect
+
+**Implementation:**
+```python
+from data_utils import link_indices_func
+
+# After saving to target dataset:
+source_indices = [item['index'] for item in extraction.data if item['value']]
+source_index_field = f"{source.replace('Data', '')}Index"  # e.g., postIndex
+target_index_field = f"{save_name.replace('Data', '')}Index"  # e.g., profileIndex
+
+link_result = link_indices_func(source_index_field, source_indices, target_index_field)
+```
 
 ### Reference Pattern (Critical)
 
@@ -115,7 +158,86 @@ python scraper.py --source postData --path "[*].author.profileUrl" --where "isPa
 python some_tool.py --source postData --where "passedRelevance=true"
 ```
 
-**Why:** Agent becomes pure orchestrator. It connects intent to tools without ever touching actual data values.
+### Skip-Already-Processed Pattern (Critical)
+
+**All tools that process items MUST skip items that have already been processed.** This prevents wasted API calls, LLM tokens, and duplicate entries.
+
+#### Pattern 1: Output File Check (for LLM/enrichment tools)
+
+Use when: Tool writes results to an output file (e.g., `postData_isPaidCanva.json`)
+
+```python
+# 1. Determine output file path
+results_file = f"{source}_{first_field}.json"
+results_path = os.path.join(TMP_DIR, results_file)
+
+# 2. Load existing results and build processed indices set
+processed_indices = set()
+if os.path.exists(results_path):
+    existing = load_json(results_path)
+    if isinstance(existing, list):
+        processed_indices = {item.get('index') for item in existing if item.get('index') is not None}
+
+# 3. Filter out already-processed items
+original_count = len(items)
+items = [item for item in items if item['index'] not in processed_indices]
+skipped = original_count - len(items)
+
+if skipped > 0:
+    print(f"Skipping {skipped} already-processed items", file=sys.stderr)
+
+if not items:
+    print("All items already processed", file=sys.stderr)
+    return
+```
+
+#### Pattern 2: Mapping Check (for scraping tools)
+
+Use when: Tool creates downstream data linked via mapping (e.g., profile scraper)
+
+```python
+# 1. Define index fields
+source_index_field = f"{source.replace('Data', '')}Index"  # e.g., postIndex
+target_index_field = f"{save_name.replace('Data', '')}Index"  # e.g., profileIndex
+
+# 2. Load mapping and find which source indices already have target indices
+mapping = load_mapping()
+already_scraped = set()
+for lead in mapping.get("leads", []):
+    if lead.get(target_index_field) is not None:
+        already_scraped.add(lead.get(source_index_field))
+
+# 3. Filter out already-scraped items
+filtered_data = [(idx, url) for idx, url in zip(source_indices, urls) if idx not in already_scraped]
+skipped = len(source_indices) - len(filtered_data)
+
+if skipped > 0:
+    print(f"Skipping {skipped} already-scraped items", file=sys.stderr)
+
+if not filtered_data:
+    print("All items already scraped", file=sys.stderr)
+    return
+```
+
+#### Safety Net: Error on Duplicate
+
+After skip logic, add a safety check before appending to output files:
+
+```python
+# Check for duplicates (should never happen if skip logic works)
+existing_indices = {item.get("index") for item in existing_results}
+new_indices = {item.get("index") for item in all_results}
+duplicates = existing_indices & new_indices
+
+if duplicates:
+    raise ValueError(f"DUPLICATE INDEX ERROR: Indices {sorted(duplicates)} already exist. Check skip logic.")
+```
+
+---
+
+### Reference Pattern Implementation
+
+**Why references matter:** Agent becomes pure orchestrator. It connects intent to tools without ever touching actual data values.
 
 **Implementation:** Tools import `extract_data` from `data_utils` and handle extraction internally.
 
@@ -252,7 +374,8 @@ Generic LLM processing for datasets. Located at `execution/llm/process.py`.
 ### Purpose
 - Process dataset items using LLM with **dynamic structured output**
 - Supports any task: classification, summarization, extraction, scoring
-- All output fields automatically mapped to `mapping.json`
+- Output fields **registered in registry** (not copied to mapping)
+- **Skips already-processed items** automatically
 
 ### Usage
 

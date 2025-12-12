@@ -178,8 +178,93 @@ def save_mapping(mapping: dict) -> None:
     save_json(MAPPING_FILE, mapping)
 
 
+def load_registry() -> dict:
+    """Load registry file or return empty structure.
+    
+    Registry tracks which LLM output files contain which fields:
+    {
+        "files": {
+            "postData_isPaidCanva.json": ["isPaidCanva", "confidence", "reasoning"],
+            "profileData_isAgency.json": ["isAgency", "agencyName", "reasoning"]
+        },
+        "fields": {
+            "isPaidCanva": "postData_isPaidCanva.json",
+            "isAgency": "profileData_isAgency.json"
+        }
+    }
+    """
+    if os.path.exists(REGISTRY_FILE):
+        return load_json(REGISTRY_FILE)
+    return {"files": {}, "fields": {}}
+
+
+def save_registry(registry: dict) -> None:
+    """Save registry file."""
+    save_json(REGISTRY_FILE, registry)
+
+
+def register_llm_output(output_file: str, fields: list[str], index_field: str) -> None:
+    """Register an LLM output file and its fields in the registry.
+    
+    Args:
+        output_file: The LLM output file name (e.g., "postData_isPaidCanva.json")
+        fields: List of field names in the output (e.g., ["isPaidCanva", "confidence"])
+        index_field: The index field used (e.g., "postIndex")
+    """
+    registry = load_registry()
+    
+    # Register file -> fields mapping
+    registry["files"][output_file] = {
+        "fields": fields,
+        "index_field": index_field
+    }
+    
+    # Register field -> file mapping (for quick lookup)
+    for field in fields:
+        if field != "index":  # Don't register the index field itself
+            registry["fields"][field] = output_file
+    
+    save_registry(registry)
+
+
+def get_field_from_registry(field: str, index_value: int) -> Any:
+    """Look up a field value from the registered LLM output file.
+    
+    Args:
+        field: Field name to look up (e.g., "isPaidCanva")
+        index_value: The index to find in the output file
+    
+    Returns:
+        The field value, or None if not found
+    """
+    registry = load_registry()
+    
+    output_file = registry.get("fields", {}).get(field)
+    if not output_file:
+        return None
+    
+    # Load the LLM output file
+    filepath = get_dataset_path(output_file)
+    if not os.path.exists(filepath):
+        return None
+    
+    data = load_json(filepath)
+    
+    # Find the item with matching index
+    for item in data:
+        if item.get("index") == index_value:
+            return item.get(field)
+    
+    return None
+
+
 def get_qualified_indices(mapping: dict, where_clause: str, index_field: str) -> Optional[list[int]]:
-    """Get indices that match the where clause."""
+    """Get indices that match the where clause.
+    
+    Now supports looking up fields from:
+    1. Directly in mapping leads (legacy/backwards compatible)
+    2. From registered LLM output files via registry
+    """
     if not where_clause:
         return None
     
@@ -196,10 +281,38 @@ def get_qualified_indices(mapping: dict, where_clause: str, index_field: str) ->
     elif value.isdigit():
         value = int(value)
     
+    # Check if field is in registry (new reference-based approach)
+    registry = load_registry()
+    output_file = registry.get("fields", {}).get(field)
+    
     qualified = []
-    for lead in mapping.get("leads", []):
-        if lead.get(field) == value:
-            qualified.append(lead.get(index_field))
+    
+    if output_file:
+        # Field is in a registered LLM output file - use reference lookup
+        file_info = registry.get("files", {}).get(output_file, {})
+        file_index_field = file_info.get("index_field", index_field)
+        
+        # Load the LLM output file
+        filepath = get_dataset_path(output_file)
+        if os.path.exists(filepath):
+            llm_data = load_json(filepath)
+            
+            # Build set of indices that match
+            matching_indices = set()
+            for item in llm_data:
+                if item.get(field) == value:
+                    matching_indices.add(item.get("index"))
+            
+            # Find leads with matching index
+            for lead in mapping.get("leads", []):
+                lead_idx = lead.get(index_field)
+                if lead_idx in matching_indices:
+                    qualified.append(lead_idx)
+    else:
+        # Legacy: field is directly in mapping leads
+        for lead in mapping.get("leads", []):
+            if lead.get(field) == value:
+                qualified.append(lead.get(index_field))
     
     return qualified
 
@@ -308,25 +421,46 @@ def update_mapping_field(index_field: str, indices: list[int], field: str, value
         return UpdateMappingOutput(status="error", error=str(e))
 
 
-def bulk_update_mapping(index_field: str, results: list[dict]) -> UpdateMappingOutput:
+def bulk_update_mapping(index_field: str, results: list[dict], output_file: str = None) -> UpdateMappingOutput:
     """
-    Bulk update mapping with all fields from results.
+    Register LLM output with the mapping system.
     
-    Each result dict must have 'index' key. All other fields are mapped to that index.
+    NEW BEHAVIOR (reference-based):
+    - If output_file is provided, registers the file in registry (no field copying)
+    - Fields stay in the LLM output file; mapping stays clean with just indices
     
-    Example:
-        results = [
-            {"index": 0, "isPaidSlack": True, "reasoning": "...", "confidence": 0.9},
-            {"index": 1, "isPaidSlack": False, "reasoning": "...", "confidence": 0.8}
-        ]
-        bulk_update_mapping("postIndex", results)
+    LEGACY BEHAVIOR (backwards compatible):
+    - If output_file is None, copies fields to mapping leads (old behavior)
+    
+    Args:
+        index_field: The index field (e.g., "postIndex")
+        results: List of dicts with 'index' and field values
+        output_file: Optional path to the LLM output file for registry
+    
+    Example (new):
+        bulk_update_mapping("postIndex", results, "postData_isPaidCanva.json")
+        # Registers file in registry, no copying
         
-    This maps ALL fields (isPaidSlack, reasoning, confidence) to each lead.
+    Example (legacy):
+        bulk_update_mapping("postIndex", results)
+        # Copies fields to mapping (backwards compatible)
     """
     try:
         mapping = load_mapping()
         
-        # Build lookup for fast access
+        # Extract field names from results (excluding 'index')
+        fields = set()
+        for result in results:
+            for key in result.keys():
+                if key != "index":
+                    fields.add(key)
+        
+        if output_file:
+            # NEW: Register the output file in registry (no copying)
+            register_llm_output(output_file, list(fields), index_field)
+            return UpdateMappingOutput(status="success", updated=len(results))
+        
+        # LEGACY: Copy fields to mapping leads (backwards compatible)
         lead_lookup = {lead.get(index_field): lead for lead in mapping.get("leads", [])}
         
         updated = 0
@@ -345,6 +479,67 @@ def bulk_update_mapping(index_field: str, results: list[dict]) -> UpdateMappingO
         
     except Exception as e:
         return UpdateMappingOutput(status="error", error=str(e))
+
+
+def link_indices_func(source_index_field: str, source_indices: list[int], target_index_field: str) -> LinkIndicesOutput:
+    """
+    Link source indices to target indices in mapping.
+    
+    CRITICAL: Call this after creating a new dataset from source data.
+    Without linking, LLM processing on target dataset cannot update mapping.
+    
+    Args:
+        source_index_field: e.g., "postIndex"
+        source_indices: list of source indices to link
+        target_index_field: e.g., "profileIndex"
+    
+    Returns:
+        LinkIndicesOutput with linked/skipped counts
+    """
+    mapping = load_mapping()
+    
+    # Find highest existing target index
+    max_target = -1
+    for lead in mapping.get("leads", []):
+        current = lead.get(target_index_field)
+        if current is not None and current > max_target:
+            max_target = current
+    
+    next_target_idx = max_target + 1
+    linked = []
+    skipped = []
+    
+    try:
+        for source_idx in source_indices:
+            lead = None
+            for l in mapping.get("leads", []):
+                if l.get(source_index_field) == source_idx:
+                    lead = l
+                    break
+            
+            if lead is None:
+                # Source index not in mapping - skip silently
+                continue
+            
+            if lead.get(target_index_field) is not None:
+                skipped.append(source_idx)
+                continue
+            
+            lead[target_index_field] = next_target_idx
+            linked.append(source_idx)
+            next_target_idx += 1
+        
+        save_mapping(mapping)
+        return LinkIndicesOutput(
+            status="success",
+            linked=linked,
+            skipped=skipped,
+            target_start=max_target + 1 if linked else None
+        )
+        
+    except Exception as e:
+        save_mapping(mapping)
+        return LinkIndicesOutput(status="error", linked=linked, skipped=skipped, error=str(e))
 
 
 # ============ COMMANDS ============

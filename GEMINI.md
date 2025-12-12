@@ -38,9 +38,10 @@ Two types of execution, both called by you:
 Key points:
 - **Tools**: All use Pydantic output models + Typer CLI
 - **Data Storage**: `.tmp/` for intermediates, datasets named `{name}Data.json`
-- **Mapping**: `.tmp/mapping.json` tracks data lineage and enrichments
+- **Mapping**: `.tmp/mapping.json` contains **index references only** (postIndex, profileIndex)
+- **Registry**: `.tmp/registry.json` tracks which LLM output files contain which fields
 - **Core Utility**: `execution/data_utils.py` for extract, link, update operations
-- **LLM Module**: `execution/llm/process.py` for LLM-powered classification, summarization, extraction
+- **LLM Module**: `execution/llm/process.py` for LLM-powered classification (auto-skips processed items)
 
 ---
 
@@ -54,16 +55,6 @@ Before writing a script, check `execution/`. Only create new scripts if none exi
 - Fix the script and test again (check with user first if paid tokens involved)  
 - **IMPORTANT**: Update the directive with what you learned
 
-### Step 4: Validate Data (LLM Processing)
-**CRITICAL:** Do not rely on search relevance alone. Search results are *candidates*, not *leads*.
-Always use `llm/process.py` to validate criteria.
-
-```bash
-python execution/llm/process.py \
-    --source postData --path "[*].content" \
-    --task "Qualify: Is this explicitly about the author USING the feature?" \
-    --output-fields "isRelevant,confidence"
-```
 **3. Update directives as you learn**  
 Directives are living documents. When you discover API constraints, better approaches, or edge cases—update the directive. Don't create/overwrite without asking unless explicitly told to.
 
@@ -88,6 +79,18 @@ When calling tools that need data from datasets:
 - **Don't** extract values into your context and pass them as arguments (Anti-Pattern: Extract-Then-Call)
 - **Do** pass `--source`, `--path`, `--where` references - let the tool extract internally
 - This keeps you as a pure orchestrator and avoids context limits
+
+**7. ALWAYS link indices when creating downstream datasets**  
+When a tool creates a new dataset from source data (e.g., scraping profiles from posts):
+- The tool MUST auto-link source indices to target indices using `link_indices_func()`
+- Without this, LLM processing on the target dataset cannot update the mapping
+- Results are silently lost — this is a **critical data integrity failure**
+- See `FRAMEWORK.md` "Index Linking Requirement" for implementation details
+
+**8. Don't ask LLM to extract what APIs already provide**  
+Before defining LLM output fields, check if the raw API data already has this information.
+- Bad: Ask LLM to extract "agencyName" when `experience[0].companyName` is already there
+- Good: Ask LLM for judgments/classifications the data doesn't have (e.g., "isAgency")
 
 ---
 
