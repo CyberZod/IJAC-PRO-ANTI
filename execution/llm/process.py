@@ -144,9 +144,11 @@ Respond with ONLY a valid JSON array, no other text."""
 @app.command()
 def process(
     source: str = typer.Option(..., help="Dataset name (e.g., postData)"),
-    path: str = typer.Option(..., help="JSON path to extract (e.g., [*].content)"),
     task: str = typer.Option(..., help="Task description in natural language"),
     output_fields: str = typer.Option(..., "--output-fields", help="Comma-separated output field names (e.g., 'summary,sentiment,score')"),
+    path: Optional[str] = typer.Option(None, help="JSON path to extract (e.g., [*].content)"),
+    fields: Optional[str] = typer.Option(None, "--fields", help="Comma-separated projection mapping (e.g., 'name=author.name')"),
+    where: Optional[str] = typer.Option(None, help="Filter condition (e.g., 'isPaidSlack=true')"),
     batch_size: int = typer.Option(DEFAULT_BATCH_SIZE, "--batch-size", help="Items per LLM call"),
     model: str = typer.Option(DEFAULT_MODEL, help="LLM model to use"),
     results_file: Optional[str] = typer.Option(None, "--results-file", help="Results filename (auto-generated if not specified)"),
@@ -160,15 +162,31 @@ def process(
     """
     try:
         # Parse output fields
-        fields = [f.strip() for f in output_fields.split(',')]
+        llm_output_fields = [f.strip() for f in output_fields.split(',')]
         
-        if not fields:
+        if not llm_output_fields:
             output = ProcessOutput(status="error", error="No output fields specified")
             print(output.model_dump_json(indent=2))
             return
+
+        # Parse projection fields if provided
+        field_map = None
+        if fields:
+            field_map = {}
+            for pair in fields.split(','):
+                if '=' in pair:
+                    k, v = pair.split('=', 1)
+                    field_map[k.strip()] = v.strip()
+                else:
+                    field_map[pair.strip()] = pair.strip()
+        
+        if not path and not field_map:
+             output = ProcessOutput(status="error", error="Must provide either --path or --fields")
+             print(output.model_dump_json(indent=2))
+             return
         
         # Use extract_data from data_utils
-        extract_result = extract_data(source, path)
+        extract_result = extract_data(source, path, field_map, where=where)
         
         if extract_result.status == "error":
             output = ProcessOutput(status="error", error=extract_result.error)
@@ -194,7 +212,7 @@ def process(
             )
             print(output.model_dump_json(indent=2))
             print(f"\nWould process {len(items)} items in {(len(items) + batch_size - 1) // batch_size} batches", file=sys.stderr)
-            print(f"Output fields: {fields}", file=sys.stderr)
+            print(f"Output fields: {llm_output_fields}", file=sys.stderr)
             return
         
         # Process in batches
@@ -207,13 +225,13 @@ def process(
             
             print(f"Processing batch {batch_num}/{total_batches}...", file=sys.stderr)
             
-            results = call_llm(batch, task, fields, model)
+            results = call_llm(batch, task, llm_output_fields, model)
             all_results.extend(results)
         
         # Auto-generate results filename if not specified
         # Format: {source}_{firstOutputField}.json
         if results_file is None:
-            first_field = fields[0]
+            first_field = llm_output_fields[0]
             results_file = f"{source}_{first_field}.json"
         
         results_path = os.path.join(TMP_DIR, results_file)

@@ -95,6 +95,7 @@ if __name__ == "__main__":
 2. **Typer CLI** for argument parsing - type-validated, self-documenting
 3. **Always print** `model.model_dump_json()` - structured output for agents
 4. **Include docstring** with PURPOSE, USAGE, SAVES TO
+5. **Use Keyword Arguments** in Python calls (e.g., `func(arg=val)`) to prevent positional errors
 
 ### Reference Pattern (Critical)
 
@@ -149,12 +150,19 @@ The core utility for all data operations. Located at `execution/data_utils.py`.
 ### extract
 Pull specific fields from a dataset with auto-indexed output.
 
+**1. Single Field Mode:**
 ```bash
 # Get all post content
 python data_utils.py extract --source postData --path "[*].content"
+```
 
-# Output:
-# [{"index": 0, "value": "Post text..."}, {"index": 1, "value": "..."}, ...]
+**2. Multi-Field Projection Mode:**
+Create a simplified object on the fly. Useful for LLM processing to reduce tokens.
+```bash
+python data_utils.py extract \
+    --source profileData \
+    --fields "name=[*].firstName,bio=[*].summary,jobs=[*].positions"
+# Output: [{"index": 0, "value": {"name": "Alice", "bio": "...", "jobs": [...]}, ...}]
 ```
 
 **Understanding the output:**
@@ -249,17 +257,26 @@ Generic LLM processing for datasets. Located at `execution/llm/process.py`.
 ### Usage
 
 ```bash
+# Option 1: Single Field (Simple)
 python execution/llm/process.py \
     --source postData \
     --path "[*].content" \
-    --task "Your task description" \
-    --output-fields "field1,field2,field3"
+    --task "Your task..." \
+    --output-fields "field1,field2"
+
+# Option 2: Multi-Field Projection (Rich Context)
+python execution/llm/process.py \
+    --source profileData \
+    --fields "name=[*].firstName,bio=[*].summary" \
+    --task "Analyze this person..." \
+    --output-fields "isStartup,reasoning"
 ```
 
 | Argument | Description |
 |----------|-------------|
 | `--source` | Dataset name (e.g., postData) |
-| `--path` | JSON path to extract for LLM |
+| `--path` | Single field path to extract |
+| `--fields` | Multi-field projection (comma-separated `key=[*].path`) |
 | `--task` | Natural language task description |
 | `--output-fields` | Comma-separated output field names |
 | `--batch-size` | Items per LLM call (default: 20) |

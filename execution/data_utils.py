@@ -23,7 +23,7 @@ python data_utils.py init-mapping --source postData --index-field "postIndex"
 import json
 import os
 import re
-from typing import Optional, Any
+from typing import Any, List, Optional, Union, Dict
 
 import typer
 from pydantic import BaseModel, Field
@@ -206,43 +206,80 @@ def get_qualified_indices(mapping: dict, where_clause: str, index_field: str) ->
 
 # ============ CALLABLE API (for import by other modules) ============
 
-def extract_data(source: str, path: str, where: Optional[str] = None, 
-                 offset: Optional[int] = None, limit: Optional[int] = None) -> ExtractOutput:
+def extract_data(source: str, path: Optional[str] = None, fields: Optional[Dict[str, str]] = None, 
+                 where: Optional[str] = None, offset: Optional[int] = None, limit: Optional[int] = None) -> ExtractOutput:
     """
-    Extract fields from dataset by path. Returns ExtractOutput model.
-    
-    Can be imported and called by other modules (e.g., LLM classify).
+    Extract data from dataset.
+    Supports single path extraction (returns value) or multi-field projection (returns dict).
     """
     try:
+        if not path and not fields:
+             return ExtractOutput(status="error", error="Must provide either 'path' or 'fields'")
+
         dataset_path = get_dataset_path(source)
         if not os.path.exists(dataset_path):
             return ExtractOutput(status="error", error=f"Dataset not found: {dataset_path}")
         
         data = load_json(dataset_path)
-        segments = parse_path(path)
-        results = navigate_path(data, segments)
         
-        if isinstance(results, list) and len(results) > 0 and isinstance(results[0], tuple):
-            output_data = [{"index": idx, "value": val} for idx, val in results]
-        else:
-            output_data = [{"index": 0, "value": results}]
-        
+        # Determine indices to process
+        indices_to_process = []
         if where:
             mapping = load_mapping()
+            # map source name to index field (e.g. postData -> postIndex)
             if source.endswith('Data'):
-                index_field = source.replace('Data', 'Index')
+                 index_field = source.replace('Data', 'Index')
             else:
-                index_field = f"{source}Index"
+                 index_field = f"{source}Index"
             
             qualified = get_qualified_indices(mapping, where, index_field)
-            if qualified is not None:
-                output_data = [item for item in output_data if item["index"] in qualified]
+            if qualified is None: # If get_qualified_indices returned None (no where clause), process all
+                indices_to_process = list(range(len(data)))
+            else:
+                indices_to_process = qualified
+        else:
+            indices_to_process = list(range(len(data)))
+            
+        if offset:
+            indices_to_process = indices_to_process[offset:]
+        if limit:
+            indices_to_process = indices_to_process[:limit]
+
+        output_data = []
         
-        if offset is not None:
-            output_data = output_data[offset:]
-        if limit is not None:
-            output_data = output_data[:limit]
-        
+        for idx in indices_to_process:
+            if idx >= len(data): 
+                continue
+            
+            item = data[idx]
+            
+            if fields:
+                # Multi-field projection
+                value = {}
+                for key, field_path in fields.items():
+                    try:
+                        segments = parse_path(field_path)
+                        if segments and segments[0][0] == 'all':
+                             value[key] = navigate_path(item, segments[1:])
+                        else:
+                             value[key] = navigate_path(item, segments)
+                    except Exception:
+                        value[key] = None
+                output_data.append({"index": idx, "value": value})
+                
+            else:
+                # Single path extraction
+                segments = parse_path(path)
+                try:
+                    if segments and segments[0][0] == 'all':
+                         val = navigate_path(item, segments[1:])
+                    else:
+                         val = navigate_path(item, segments)
+                    output_data.append({"index": idx, "value": val})
+                except Exception:
+                    # If path doesn't exist for this item
+                    output_data.append({"index": idx, "value": None})
+                    
         return ExtractOutput(status="success", data=output_data, count=len(output_data))
         
     except Exception as e:
@@ -312,52 +349,50 @@ def bulk_update_mapping(index_field: str, results: list[dict]) -> UpdateMappingO
 
 # ============ COMMANDS ============
 
-@app.command()
+@app.command("extract")
 def extract(
-    source: str = typer.Option(..., help="Dataset name (e.g., postData)"),
-    path: str = typer.Option(..., help="Path notation (e.g., [*].content)"),
-    where: Optional[str] = typer.Option(None, help="Filter using mapping (e.g., passedRelevance=true)"),
-    offset: Optional[int] = typer.Option(None, help="Pagination offset"),
-    limit: Optional[int] = typer.Option(None, help="Pagination limit")
+    source: str = typer.Option(..., help="Source dataset name"),
+    path: Optional[str] = typer.Option(None, help="Path to extract (single field mode)"),
+    fields: Optional[str] = typer.Option(None, help="Comma-separated mapping key=path (projection mode)"),
+    where: Optional[str] = typer.Option(None, help="Filter condition"),
+    offset: Optional[int] = typer.Option(None, help="Start offset"),
+    limit: Optional[int] = typer.Option(None, help="Max items"),
+    save_name: Optional[str] = typer.Option(None, help="Save to new dataset")
 ):
-    """Extract fields from dataset by path with auto-indexed output."""
-    try:
-        dataset_path = get_dataset_path(source)
-        if not os.path.exists(dataset_path):
-            output = ExtractOutput(status="error", error=f"Dataset not found: {dataset_path}")
-            print(output.model_dump_json(indent=2))
-            return
-        
-        data = load_json(dataset_path)
-        segments = parse_path(path)
-        results = navigate_path(data, segments)
-        
-        if isinstance(results, list) and len(results) > 0 and isinstance(results[0], tuple):
-            output_data = [{"index": idx, "value": val} for idx, val in results]
-        else:
-            output_data = [{"index": 0, "value": results}]
-        
-        if where:
-            mapping = load_mapping()
-            if source.endswith('Data'):
-                index_field = source.replace('Data', 'Index')
+    """
+    Extract data from a dataset.
+    
+    Modes:
+    1. Single Field: --path "[*].content"
+    2. Multi Field: --fields "name=author.name,bio=author.info"
+    """
+    # Parse fields if provided
+    field_map = None
+    if fields:
+        field_map = {}
+        for pair in fields.split(','):
+            if '=' in pair:
+                k, v = pair.split('=', 1)
+                field_map[k.strip()] = v.strip()
             else:
-                index_field = f"{source}Index"
-            
-            qualified = get_qualified_indices(mapping, where, index_field)
-            if qualified is not None:
-                output_data = [item for item in output_data if item["index"] in qualified]
-        
-        if offset is not None:
-            output_data = output_data[offset:]
-        if limit is not None:
-            output_data = output_data[:limit]
-        
-        output = ExtractOutput(status="success", data=output_data, count=len(output_data))
-        print(output.model_dump_json(indent=2))
-        
-    except Exception as e:
-        output = ExtractOutput(status="error", error=str(e))
+                field_map[pair.strip()] = pair.strip()
+
+    output = extract_data(source, path, field_map, where, offset, limit)
+    
+    if output.status == "success" and save_name and output.data:
+        # Extract values only for saving to dataset? 
+        # Or save the struct format?
+        # Standard: Save the 'value' part as the new dataset list
+        to_save = [item['value'] for item in output.data]
+        saved_path = get_dataset_path(save_name)
+        save_json(saved_path, to_save)
+        # We don't have saved_to in ExtractOutput, so just print info
+        print(json.dumps({
+            "status": "success",
+            "count": output.count,
+            "saved_to": saved_path
+        }, indent=2))
+    else:
         print(output.model_dump_json(indent=2))
 
 

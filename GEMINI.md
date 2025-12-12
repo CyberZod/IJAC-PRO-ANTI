@@ -52,8 +52,18 @@ Before writing a script, check `execution/`. Only create new scripts if none exi
 **2. Self-anneal when things break**  
 - Read error message and stack trace  
 - Fix the script and test again (check with user first if paid tokens involved)  
-- Update the directive with what you learned
+- **IMPORTANT**: Update the directive with what you learned
 
+### Step 4: Validate Data (LLM Processing)
+**CRITICAL:** Do not rely on search relevance alone. Search results are *candidates*, not *leads*.
+Always use `llm/process.py` to validate criteria.
+
+```bash
+python execution/llm/process.py \
+    --source postData --path "[*].content" \
+    --task "Qualify: Is this explicitly about the author USING the feature?" \
+    --output-fields "isRelevant,confidence"
+```
 **3. Update directives as you learn**  
 Directives are living documents. When you discover API constraints, better approaches, or edge cases—update the directive. Don't create/overwrite without asking unless explicitly told to.
 
@@ -61,20 +71,23 @@ Directives are living documents. When you discover API constraints, better appro
 - Save to file when agent needs to review/filter data  
 - Keep in-memory for direct pass-through with no decisions
 
-**5. Test new tools before planning**  
+**5. Test all tools before planning when**  
 For first-time use of external APIs, Apify actors, or libraries:
 1. Ask user: "I should test these tools to understand their output schema. This may use API credits—proceed?"
 2. Run minimal test (1-2 items)
 3. Observe output structure, document in tool file
 4. Then create informed plan
 
-Skip this if the tool file already documents the schema (Pydantic models).
+**IMPORTANT:** This is CRITICAL for all APIs when first creating a workflow.
+After creating the workflow, you can use the tool without testing unless new APIs are added.
+
+**IMPORTANT:** For large existing datasets, use `data_utils.py` with `--limit 1` or `view_file` (head) to inspect schema without reading the whole file.
 
 **6. Route references, not data**  
 When calling tools that need data from datasets:
-- **Don't** extract values and pass them as arguments
+- **Don't** extract values into your context and pass them as arguments (Anti-Pattern: Extract-Then-Call)
 - **Do** pass `--source`, `--path`, `--where` references - let the tool extract internally
-- This keeps you as a pure orchestrator
+- This keeps you as a pure orchestrator and avoids context limits
 
 ---
 
@@ -130,3 +143,5 @@ You sit between human intent (directives) and deterministic execution (Python sc
 Be pragmatic. Be reliable. Self-anneal.
 
 **For technical details on data utilities, tool standards, and workflow patterns, see `FRAMEWORK.md`.**
+
+**Ensure you read `FRAMEWORK.md` before starting any work.**
